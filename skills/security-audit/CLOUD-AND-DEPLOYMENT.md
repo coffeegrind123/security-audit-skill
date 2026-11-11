@@ -71,6 +71,15 @@ A function or worker trusts event body fields as source identity without validat
 **Edge/runtime boundary mismatch**
 An edge or serverless runtime assumes a secret, API, filesystem, isolation, or tenant policy that differs from the origin runtime, and fallback to origin changes authority or cache behavior. Confirm which configuration selects each path.
 
+**Edge isolate global-scope state leakage across requests**
+In V8 isolate and edge serverless runtimes (such as Cloudflare Workers, Fastly Compute, or Deno), module-level and global-scope variables persist across request invocations within the same warm isolate instance. When request-scoped data (such as authenticated user context, session tokens, tenant identifiers, or decrypted payloads) is assigned to outer-scope variables or unreset singletons, consecutive requests routed to that warm isolate observe or mutate state belonging to a different caller. Trace variable lifecycle, request handler scoping, and asynchronous context clearing.
+
+**Edge subrequest recursion and amplification loop**
+An edge handler, proxy, or serverless router initiates subrequests (`fetch`) where the destination URI, protocol, or forwarding headers are derived from lower-trust request input without recursion-depth guards, loop-prevention headers, or internal hop counters. An untrusted caller can trigger infinite subrequest loops back through the same edge zone or origin infrastructure, leading to rapid billing exhaustion, denial of service, and origin thread starvation.
+
+**Eventual-consistency storage race on distributed edge stores**
+An edge worker or distributed function performs check-then-act operations (such as single-use token invalidation, coupon redemption, quota decrement, or replay deduplication) against an eventually-consistent global key-value store without transactional coordination (such as atomic compare-and-swap, local strongly-consistent transactional storage, or single-actor routing). Because writes take seconds to propagate across global edge points of presence (PoPs), concurrent requests hitting distinct regional PoPs succeed simultaneously, bypassing intended business or security constraints.
+
 ## Universal moves (apply across the above)
 
 - Render every maintained environment and make a matrix of external port, workload identity, network peers, mounted secrets, and cloud resources. Differences require an owner or policy explanation.

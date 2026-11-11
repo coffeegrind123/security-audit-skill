@@ -10,17 +10,20 @@ const {
   encodeCanonicalRef,
   isSafeAgentId,
   isSafeRelativePath,
+  openWindowsInputDescriptor,
   preflightJsonText,
+  sameFileIdentity,
   validateDocument,
 } = require("./validate-coverage-ledger.cjs");
 
 const validatorPath = path.join(__dirname, "validate-coverage-ledger.cjs");
 const CLI_TIMEOUT_MS = 5000;
 const HOSTILE_CLI_TIMEOUT_MS = 15000;
-const HAS_SAFE_INPUT_OPEN = Number.isInteger(fs.constants.O_NOFOLLOW) &&
+// Windows has no O_NOFOLLOW or O_NONBLOCK; the validators use an identity-checked open there.
+const HAS_SAFE_INPUT_OPEN = process.platform === "win32" || (Number.isInteger(fs.constants.O_NOFOLLOW) &&
   fs.constants.O_NOFOLLOW !== 0 &&
   Number.isInteger(fs.constants.O_NONBLOCK) &&
-  fs.constants.O_NONBLOCK !== 0;
+  fs.constants.O_NONBLOCK !== 0);
 
 function unit(overrides = {}) {
   const canonicalRefs = overrides.canonical_refs || {
@@ -58,12 +61,12 @@ function errorsFor(value) {
 }
 
 function runCli(contents, options = {}) {
-  const { nodeArgs = [], timeout = CLI_TIMEOUT_MS } = options;
+  const { nodeArgs = [], timeout = CLI_TIMEOUT_MS, extraArgs = [] } = options;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-"));
   const ledgerPath = path.join(directory, "coverage-ledger.json");
   try {
     fs.writeFileSync(ledgerPath, contents);
-    return spawnSync(process.execPath, [...nodeArgs, validatorPath, ledgerPath], {
+    return spawnSync(process.execPath, [...nodeArgs, validatorPath, ledgerPath, ...extraArgs], {
       encoding: "utf8",
       timeout,
     });
@@ -125,6 +128,214 @@ function archivedAttempt(overrides = {}) {
   };
   return Object.assign(value, overrides);
 }
+
+function localLedger() {
+  return [unit({
+    status: "covered",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [localCheck()],
+  })];
+}
+
+function withOutputDirectory(callback) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "coverage-artifacts-"));
+  try {
+    return callback(directory);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function writeArtifact(directory, artifact = "agents/hunter-1/artifacts/result.txt") {
+  const file = path.join(directory, artifact);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, "Bounded fixture result.\n");
+  return file;
+}
+
+test("artifact-aware validation rejects absent evidence for every terminal state", () => {
+  withOutputDirectory((outputDir) => {
+    for (const status of ["covered", "blocked", "candidate"]) {
+      const ledger = localLedger();
+      ledger[0].status = status;
+      if (status === "blocked") ledger[0].unresolved = ["The integration fixture is unavailable."];
+      if (status === "candidate") ledger[0].result_fingerprints = ["missing-owner-check"];
+      assert.deepEqual(errorsFor(ledger), [], "the in-memory API remains structural by default");
+      assert.match(validateDocument(ledger, { outputDir }).join("\n"),
+        /\$\[0\]\.local_checks\[0\]\.artifact: local check artifact does not exist/);
+    }
+  });
+});
+
+test("artifact-aware validation accepts retained files and independently owned checks", () => {
+  withOutputDirectory((outputDir) => {
+    const ledger = localLedger();
+    ledger[0].local_checks.push(localCheck("verifier-1", {
+      artifact: "agents/verifier-1/artifacts/nested/证据.txt",
+    }));
+    for (const check of ledger[0].local_checks) writeArtifact(outputDir, check.artifact);
+    assert.deepEqual(validateDocument(ledger, { outputDir }), []);
+    assert.deepEqual(validateDocument([unit()], { outputDir }), []);
+  });
+});
+
+test("artifact-aware validation checks archived evidence even when live work is deferred", () => {
+  withOutputDirectory((outputDir) => {
+    const ledger = [unit({
+      wave: 2,
+      status: "deferred",
+      unresolved: ["No budget for another assignment."],
+      attempts: [archivedAttempt({ local_checks: [localCheck()] })],
+    })];
+    assert.match(validateDocument(ledger, { outputDir }).join("\n"),
+      /\$\[0\]\.attempts\[0\]\.local_checks\[0\]\.artifact: local check artifact does not exist/);
+    writeArtifact(outputDir);
+    assert.deepEqual(validateDocument(ledger, { outputDir }), []);
+  });
+});
+
+test("artifact-aware validation rejects directories and non-directory parents", () => {
+  withOutputDirectory((outputDir) => {
+    const artifact = path.join(outputDir, localLedger()[0].local_checks[0].artifact);
+    fs.mkdirSync(artifact, { recursive: true });
+    assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /artifact must be a regular file/);
+  });
+  withOutputDirectory((outputDir) => {
+    fs.writeFileSync(path.join(outputDir, "agents"), "not a directory");
+    assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /artifact parent must be a directory/);
+  });
+});
+
+test("artifact-aware validation rejects hard-linked evidence", () => {
+  withOutputDirectory((outputDir) => {
+    const file = writeArtifact(outputDir);
+    fs.linkSync(file, path.join(outputDir, "alias.txt"));
+    assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /artifact must not have multiple hard links/);
+  });
+});
+
+test("artifact-aware validation rejects a junction or symlink at each parent level", () => {
+  for (const relative of ["agents", "agents/hunter-1", "agents/hunter-1/artifacts"]) {
+    withOutputDirectory((outputDir) => {
+      const target = path.join(outputDir, "other-owner");
+      fs.mkdirSync(target);
+      const link = path.join(outputDir, relative);
+      fs.mkdirSync(path.dirname(link), { recursive: true });
+      fs.symlinkSync(target, link, process.platform === "win32" ? "junction" : "dir");
+      assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /artifact path must not contain symlinks/);
+    });
+  }
+});
+
+test("artifact-aware validation rejects a symlink leaf including dangling links", { skip: process.platform === "win32" }, () => {
+  withOutputDirectory((outputDir) => {
+    const file = writeArtifact(outputDir);
+    for (const [name, target] of [["linked.txt", file], ["dangling.txt", path.join(outputDir, "missing")]]) {
+      const ledger = localLedger();
+      ledger[0].local_checks[0].artifact = `agents/hunter-1/artifacts/${name}`;
+      fs.symlinkSync(target, path.join(outputDir, ledger[0].local_checks[0].artifact));
+      assert.match(validateDocument(ledger, { outputDir }).join("\n"), /artifact path must not contain symlinks/);
+    }
+  });
+});
+
+test("artifact-aware validation rejects a FIFO without opening it", { skip: process.platform === "win32" }, () => {
+  withOutputDirectory((outputDir) => {
+    const file = path.join(outputDir, localLedger()[0].local_checks[0].artifact);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const result = spawnSync("mkfifo", [file], { encoding: "utf8", timeout: CLI_TIMEOUT_MS });
+    assert.equal(result.status, 0, cliOutput(result));
+    assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /artifact must be a regular file/);
+  });
+});
+
+test("artifact-aware validation rejects an invalid or symlinked output root", () => {
+  withOutputDirectory((directory) => {
+    const file = path.join(directory, "file");
+    fs.writeFileSync(file, "not a directory");
+    for (const outputDir of ["", null, 42, file, path.join(directory, "missing")]) {
+      assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /output directory/);
+    }
+    const target = path.join(directory, "real");
+    const outputDir = path.join(directory, "alias");
+    fs.mkdirSync(target);
+    fs.symlinkSync(target, outputDir, process.platform === "win32" ? "junction" : "dir");
+    assert.match(validateDocument(localLedger(), { outputDir }).join("\n"), /output directory must not be a symlink/);
+  });
+});
+
+test("artifact-aware validation keeps structural errors ahead of filesystem checks", () => {
+  const ledger = localLedger();
+  ledger[0].local_checks[0].artifact = "agents/another-owner/artifacts/result.txt";
+  assert.deepEqual(validateDocument(ledger, { outputDir: "missing-output" }), errorsFor(ledger));
+});
+
+test("artifact-aware validation caps missing-artifact diagnostics", () => {
+  withOutputDirectory((outputDir) => {
+    const ledger = localLedger();
+    ledger[0].local_checks = Array.from({ length: LIMITS.validationErrors + 1 }, (_, index) =>
+      localCheck("hunter-1", { artifact: `agents/hunter-1/artifacts/missing-${index}.txt` }));
+    const errors = validateDocument(ledger, { outputDir });
+    assert.equal(errors.length, LIMITS.validationErrors);
+    assert(errors.every((error) => error.includes("artifact does not exist")));
+  });
+});
+
+test("CLI fails closed when safe input opening is unavailable", { skip: HAS_SAFE_INPUT_OPEN }, () => {
+  const result = runCli("[]");
+  assert.equal(result.status, 1, cliOutput(result));
+  assert.match(result.stderr, /OS no-follow and nonblocking input protection is unavailable/);
+  assert.doesNotMatch(cliOutput(result), /PASS:|\n\s+at /);
+});
+
+test("CLI rejects malformed output-directory arguments", () => {
+  for (const args of [[], ["ledger.json", "--output-dir"], ["ledger.json", "--output-dir", ""],
+    ["ledger.json", "--unknown", "run"], ["ledger.json", "extra"], ["ledger.json", "--output-dir", "run", "extra"]]) {
+    const result = spawnSync(process.execPath, [validatorPath, ...args], { encoding: "utf8", timeout: CLI_TIMEOUT_MS });
+    assert.equal(result.status, 1, cliOutput(result));
+    assert.match(result.stderr, /Usage:.*\[--output-dir <run-dir>\]/);
+    assert.doesNotMatch(cliOutput(result), /PASS:|\n\s+at /);
+  }
+});
+
+test("CLI checks artifacts beside the ledger regardless of the working directory", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withOutputDirectory((outputDir) => {
+    const ledger = localLedger();
+    const ledgerPath = path.join(outputDir, "coverage-ledger.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify(ledger));
+    function run() {
+      return spawnSync(process.execPath, [validatorPath, ledgerPath], {
+        cwd: __dirname, encoding: "utf8", timeout: CLI_TIMEOUT_MS,
+      });
+    }
+    const missing = run();
+    assert.equal(missing.status, 1, cliOutput(missing));
+    assert.match(missing.stderr, /artifact does not exist/);
+    writeArtifact(outputDir);
+    const valid = run();
+    assert.equal(valid.status, 0, cliOutput(valid));
+    assert.match(valid.stdout, /PASS: 1 coverage units valid/);
+  });
+});
+
+test("CLI supports an explicit retained output directory", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withOutputDirectory((directory) => {
+    const outputDir = path.join(directory, "run");
+    const ledgerPath = path.join(directory, "exported-ledger.json");
+    fs.writeFileSync(ledgerPath, JSON.stringify(localLedger()));
+    writeArtifact(outputDir);
+    const valid = spawnSync(process.execPath, [validatorPath, ledgerPath, "--output-dir", outputDir], {
+      encoding: "utf8", timeout: CLI_TIMEOUT_MS,
+    });
+    assert.equal(valid.status, 0, cliOutput(valid));
+    const missing = spawnSync(process.execPath, [validatorPath, ledgerPath], {
+      encoding: "utf8", timeout: CLI_TIMEOUT_MS,
+    });
+    assert.equal(missing.status, 1, cliOutput(missing));
+    assert.match(missing.stderr, /artifact does not exist/);
+  });
+});
 
 test("accepts an empty ledger and complete units", () => {
   assert.deepEqual(errorsFor([]), []);
@@ -198,6 +409,36 @@ test("text preflight rejects malformed structural truncation cleanly", () => {
   assert.throws(() => preflightJsonText("[{\"field\":1]"), /mismatched JSON containers/);
 });
 
+test("text preflight rejects duplicate object keys instead of keeping the last one", () => {
+  const contents = JSON.stringify([unit()]);
+  assert.doesNotThrow(() => preflightJsonText(contents));
+
+  for (const duplicate of [
+    "\"status\":\"covered\",\"status\":",
+    "\"st\\u0061tus\":\"covered\",\"status\":",
+  ]) {
+    assert.throws(
+      () => preflightJsonText(contents.replace("\"status\":", duplicate)),
+      /duplicate object key "status"/,
+    );
+  }
+  assert.throws(
+    () => preflightJsonText(contents.replace("\"surface\":\"src", "\"surface\":\"other\",\"surface\":\"src")),
+    /duplicate object key "surface"/,
+  );
+  assert.throws(() => preflightJsonText("[{\"\\u001b\":1,\"\\u001b\":2}]"), /duplicate object key "\\u001b"/);
+
+  assert.doesNotThrow(() => preflightJsonText("[{\"a\":1,\"A\":1,\"\\u00e9\":1,\"e\\u0301\":1}]"));
+  assert.doesNotThrow(() => preflightJsonText("[{\"a\":{\"a\":1}},{\"a\":[{\"a\":1},{\"a\":1}]}]"));
+  assert.doesNotThrow(() => preflightJsonText("[{\"a\":\"a\",\"b\":\"a\"}]"));
+
+  if (HAS_SAFE_INPUT_OPEN) {
+    const result = runCli(contents.replace("\"status\":", "\"status\":\"covered\",\"status\":"));
+    assert.equal(result.status, 1, cliOutput(result));
+    assert.match(result.stderr, /duplicate object key "status"/);
+  }
+});
+
 test("derives collision-free canonical IDs from exact UTF-8 references", () => {
   assert.equal(encodeCanonicalRef("route:POST /users"), "route%3APOST%20%2Fusers");
   assert.notEqual(encodeCanonicalRef("route name"), encodeCanonicalRef("route-name"));
@@ -255,8 +496,94 @@ test("validates assignment block maps", () => {
   });
   assert(errorsFor([overlap]).some((error) => error.includes("also selected")));
 
+  const ordinaryExcluded = unit({
+    excluded_blocks: [{ block: "ATTACK-CLASSES.md#Access control", reason: "Claimed irrelevant." }],
+  });
+  assert.deepEqual(errorsFor([ordinaryExcluded]), [
+    "$[0].excluded_blocks[0].block: block is also the ordinary attack-class block",
+  ]);
+  assert.deepEqual(errorsFor([unit({
+    ordinary_attack_class_block: null,
+    excluded_blocks: [{ block: "ATTACK-CLASSES.md#Access control", reason: "No ordinary block applies." }],
+  })]), []);
+
   const noReason = unit({ excluded_blocks: [{ block: "AI-AND-LLM.md#Tool calls", reason: "" }] });
   assert(errorsFor([noReason]).some((error) => error.includes("reason")));
+});
+
+function assignmentUnit(status) {
+  const value = unit({ status });
+  if (status !== "planned") value.agent_id = "hunter-1";
+  if (["blocked", "covered", "candidate"].includes(status)) {
+    value.reviewed_paths = ["src/router.ts"];
+    value.local_checks = [sourceCheck()];
+  }
+  if (status === "blocked") value.unresolved = ["The deployed policy is unavailable."];
+  if (status === "candidate") value.result_fingerprints = ["src-router-owner-check"];
+  return value;
+}
+
+test("requires the canonical ordinary assignment block in active coverage states", async (t) => {
+  for (const status of ["in_progress", "blocked", "covered", "candidate"]) {
+    const matching = assignmentUnit(status);
+    assert.deepEqual(errorsFor([matching]), [], status);
+    for (const block of [null, "ATTACK-CLASSES.md#Injection"]) {
+      await t.test(`${status} rejects ${block === null ? "missing" : "different"} ordinary block`, () => {
+        const value = { ...matching, ordinary_attack_class_block: block };
+        assert(errorsFor([value]).some((error) => error.includes(".ordinary_attack_class_block:")));
+      });
+    }
+  }
+});
+
+test("does not accept an ordinary assignment block only in the companion list", () => {
+  const value = assignmentUnit("in_progress");
+  value.ordinary_attack_class_block = null;
+  value.selected_companion_blocks = [value.canonical_refs.attack_class];
+  assert(errorsFor([value]).some((error) => error.includes(".ordinary_attack_class_block:")));
+});
+
+test("allows unassigned exclusions and nonordinary classes without an ordinary assignment block", () => {
+  for (const status of ["planned", "not_applicable", "out_of_scope", "deferred"]) {
+    const value = unit({
+      status,
+      ordinary_attack_class_block: null,
+      unresolved: status === "planned" ? [] : ["This unit is not assigned in the current pass."],
+    });
+    assert.deepEqual(errorsFor([value]), [], status);
+  }
+
+  for (const attackClass of ["AI-AND-LLM.md#Tool-argument injection into a downstream sink", "src/policy.ts#Custom invariant"]) {
+    const value = assignmentUnit("covered");
+    value.canonical_refs = { ...value.canonical_refs, attack_class: attackClass };
+    value.coverage_id = canonicalCoverageId(value.canonical_refs);
+    value.attack_class = attackClass.split("#")[1];
+    value.ordinary_attack_class_block = null;
+    value.selected_companion_blocks = attackClass.startsWith("AI-AND-LLM.md#")
+      ? [attackClass, "AI-AND-LLM.md#Core discipline", "AI-AND-LLM.md#Universal moves", "AI-AND-LLM.md#Validation rules"]
+      : [];
+    assert.deepEqual(errorsFor([value]), [], attackClass);
+  }
+});
+
+test("requires an ordinary assignment block when a planned unit is assigned", () => {
+  const value = unit({ ordinary_attack_class_block: null });
+  assert.deepEqual(errorsFor([value]), []);
+
+  value.status = "in_progress";
+  value.agent_id = "hunter-1";
+  assert(errorsFor([value]).some((error) => error.includes(".ordinary_attack_class_block:")));
+});
+
+test("CLI rejects covered ordinary-class evidence with the wrong assignment block", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const value = assignmentUnit("covered");
+  const valid = runCli(JSON.stringify([value]));
+  assert.equal(valid.status, 0, cliOutput(valid));
+
+  value.ordinary_attack_class_block = "ATTACK-CLASSES.md#Injection";
+  const invalid = runCli(JSON.stringify([value]));
+  assert.equal(invalid.status, 1, cliOutput(invalid));
+  assert.match(invalid.stderr, /\$\[0\]\.ordinary_attack_class_block:/);
 });
 
 test("requires owned artifacts for local checks and null artifacts for source checks", () => {
@@ -404,6 +731,92 @@ test("enforces state evidence", () => {
   assert(errorsFor([coveredUnresolved]).some((error) => error.includes("unresolved")));
 });
 
+test("terminal validation rejects in_progress and planned units", () => {
+  const inProgress = unit({ status: "in_progress", agent_id: "hunter-1" });
+  assert.deepEqual(errorsFor([inProgress]), []);
+  assert(validateDocument([inProgress], { terminal: true })
+    .some((error) => error.includes("terminal ledger cannot include in_progress units")));
+
+  const planned = unit();
+  assert.deepEqual(errorsFor([planned]), []);
+  assert(validateDocument([planned], { terminal: true })
+    .some((error) => error.includes("terminal ledger cannot include planned units")));
+
+  const covered = unit({
+    status: "covered",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [sourceCheck()],
+  });
+  const blocked = unit({
+    canonical_refs: {
+      surface: "src/policy.ts#evaluate",
+      boundary: "src/authz.ts#requireOwner",
+      subsystem: "packages/api",
+      attack_class: "ATTACK-CLASSES.md#Access control",
+    },
+    surface: "Policy evaluate route",
+    status: "blocked",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [sourceCheck()],
+    unresolved: ["The deployed policy is unavailable."],
+  });
+  const deferred = unit({
+    canonical_refs: {
+      surface: "src/export.ts#GET /export",
+      boundary: "src/authz.ts#requireOwner",
+      subsystem: "packages/api",
+      attack_class: "ATTACK-CLASSES.md#Access control",
+    },
+    surface: "Export route",
+    status: "deferred",
+    unresolved: ["hunter_never_returned"],
+  });
+  const finished = [blocked, covered, deferred].sort((left, right) => (
+    left.coverage_id < right.coverage_id ? -1 : 1
+  ));
+  assert.deepEqual(validateDocument(finished, { terminal: true }), []);
+});
+
+test("CLI --terminal rejects a never-returned in_progress assignment", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const inProgress = unit({ status: "in_progress", agent_id: "hunter-1" });
+  const before = runCli(JSON.stringify([inProgress]));
+  assert.equal(before.status, 0, cliOutput(before));
+  assert.match(before.stdout, /PASS: 1 coverage units valid/);
+
+  const after = runCli(JSON.stringify([inProgress]), { extraArgs: ["--terminal"] });
+  const output = cliOutput(after);
+  assert.equal(after.status, 1, output);
+  assert.match(output, /terminal ledger cannot include in_progress units/);
+});
+
+test("CLI --terminal accepts a finished ledger with disclosed blocked and deferred units", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const covered = unit({
+    status: "covered",
+    agent_id: "hunter-1",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [sourceCheck()],
+  });
+  const deferred = unit({
+    canonical_refs: {
+      surface: "src/export.ts#GET /export",
+      boundary: "src/authz.ts#requireOwner",
+      subsystem: "packages/api",
+      attack_class: "ATTACK-CLASSES.md#Access control",
+    },
+    surface: "Export route",
+    status: "deferred",
+    unresolved: ["hunter_never_returned"],
+  });
+  const ledger = [covered, deferred].sort((left, right) => (
+    left.coverage_id < right.coverage_id ? -1 : 1
+  ));
+  const result = runCli(JSON.stringify(ledger), { extraArgs: ["--terminal"] });
+  assert.equal(result.status, 0, cliOutput(result));
+  assert.match(result.stdout, /PASS: 2 coverage units valid/);
+});
+
 test("archives prior evidence when a critic assigns a fresh owner", () => {
   const reassigned = unit({
     attempts: [archivedAttempt()],
@@ -488,6 +901,53 @@ test("rejects reassignment owner reuse and evidence mixing", () => {
     agent_id: "hunter-3",
   });
   assert(errorsFor([unordered]).some((error) => error.includes("strictly increasing")));
+});
+
+test("rejects reuse of verifier owners from archived checks", () => {
+  const reusedVerifier = unit({
+    attempts: [archivedAttempt({ local_checks: [localCheck("verifier-1")] })],
+    wave: 2,
+    status: "covered",
+    agent_id: "hunter-2",
+    reviewed_paths: ["src/router.ts"],
+    local_checks: [localCheck("verifier-1")],
+  });
+  assert(errorsFor([reusedVerifier]).some((error) => error.includes("prior verifier owner evidence must remain in its archived attempt")));
+
+  const reusedAsHunter = unit({
+    attempts: [archivedAttempt({ local_checks: [localCheck("verifier-1")] })],
+    wave: 2,
+    status: "in_progress",
+    agent_id: "verifier-1",
+  });
+  assert(errorsFor([reusedAsHunter]).some((error) => error.includes("current assignment owner must be fresh after reassignment")));
+});
+
+test("allows checks within one attempt to share a promoted artifact", () => {
+  const sharedArtifact = "agents/hunter-1/artifacts/result.txt";
+  const sharedCheck = () => localCheck("hunter-1", { artifact: sharedArtifact });
+
+  const sameAttempt = unit({
+    attempts: [archivedAttempt({ local_checks: [sharedCheck(), sharedCheck()] })],
+    wave: 2,
+    status: "in_progress",
+    agent_id: "hunter-2",
+  });
+  assert.deepEqual(errorsFor([sameAttempt]), []);
+
+  // The same sharing is still rejected as soon as an attempt boundary is crossed.
+  const acrossAttempts = unit({
+    attempts: [
+      archivedAttempt({ local_checks: [sharedCheck()] }),
+      archivedAttempt({ wave: 2, agent_id: "hunter-2", local_checks: [localCheck("hunter-2", { artifact: sharedArtifact })] }),
+    ],
+    wave: 3,
+    status: "in_progress",
+    agent_id: "hunter-3",
+  });
+  assert(
+    errorsFor([acrossAttempts]).some((error) => error.includes("artifact from an earlier attempt cannot be reused")),
+  );
 });
 
 test("rejects unsafe paths and malformed fingerprints", () => {
@@ -737,4 +1197,146 @@ test("accepts a canonical ID derived from near-maximum multibyte references", ()
     const result = runCli(JSON.stringify([value]));
     assert.equal(result.status, 0, cliOutput(result));
   }
+});
+
+test("sameFileIdentity matches only an equal, reported volume and file index", () => {
+  const base = { dev: 7n, ino: 42n };
+  assert.equal(sameFileIdentity(base, { dev: 7n, ino: 42n }), true);
+  assert.equal(sameFileIdentity(base, { dev: 8n, ino: 42n }), false);
+  assert.equal(sameFileIdentity(base, { dev: 7n, ino: 43n }), false);
+  assert.equal(sameFileIdentity({ dev: 7n, ino: 0n }, { dev: 7n, ino: 0n }), false);
+});
+
+function windowsCliRun(inputPath) {
+  const result = spawnSync(process.execPath, [validatorPath, inputPath], {
+    encoding: "utf8",
+    timeout: CLI_TIMEOUT_MS,
+  });
+  const output = cliOutput(result);
+  assert.notEqual(result.error && result.error.code, "ETIMEDOUT", output);
+  assert.equal(result.status, 1, output);
+  assert.doesNotMatch(output, /stack|at validate-coverage-ledger/i);
+  return output;
+}
+
+test("Windows: accepts a regular file through the identity-checked open", { skip: process.platform !== "win32" }, () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-win-regular-"));
+  const inputPath = path.join(directory, "input.json");
+  try {
+    fs.writeFileSync(inputPath, JSON.stringify([unit()]));
+    const result = spawnSync(process.execPath, [validatorPath, inputPath], {
+      encoding: "utf8",
+      timeout: CLI_TIMEOUT_MS,
+    });
+    const output = cliOutput(result);
+    assert.equal(result.status, 0, output);
+    assert.doesNotMatch(output, /no-follow and nonblocking input protection is unavailable/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a directory junction without following it", { skip: process.platform !== "win32" }, () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-win-junction-"));
+  const junctionPath = path.join(directory, "input.json");
+  try {
+    fs.symlinkSync(directory, junctionPath, "junction");
+    assert.match(windowsCliRun(junctionPath), /input must not be a symlink/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a file symlink without following it", { skip: process.platform !== "win32" }, (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-coverage-ledger-win-symlink-"));
+  const targetPath = path.join(directory, "target.json");
+  const symlinkPath = path.join(directory, "input.json");
+  try {
+    fs.writeFileSync(targetPath, JSON.stringify([unit()]));
+    try {
+      fs.symlinkSync(targetPath, symlinkPath, "file");
+    } catch (error) {
+      if (error && error.code === "EPERM") {
+        t.skip("creating a file symlink needs Developer Mode or administrator rights");
+        return;
+      }
+      throw error;
+    }
+    assert.match(windowsCliRun(symlinkPath), /input must not be a symlink/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a device name without opening or blocking", { skip: process.platform !== "win32" }, () => {
+  const separator = String.fromCharCode(92);
+  const pipePath = ["", "", ".", "pipe", "validate-coverage-ledger-absent"].join(separator);
+  for (const device of ["CON", "NUL", pipePath]) {
+    windowsCliRun(device);
+  }
+});
+
+// Deterministic race coverage: a scripted fs returns chosen stat results for the first
+// lstat, the fstat of the opened descriptor, and the second lstat, so each swap lands
+// at an exact step. Runs on every platform.
+function fakeStat({ dev = 7n, ino = 42n, link = false, file = true } = {}) {
+  return { dev, ino, isSymbolicLink: () => link, isFile: () => file };
+}
+
+function scriptedFs({ before, opened, after }) {
+  const calls = [];
+  let lstats = 0;
+  return {
+    calls,
+    lstatSync(file, options) {
+      calls.push("lstat");
+      assert.deepEqual(options, { bigint: true });
+      lstats += 1;
+      return lstats === 1 ? before : after;
+    },
+    openSync() {
+      calls.push("open");
+      return 99;
+    },
+    fstatSync(descriptor, options) {
+      calls.push("fstat");
+      assert.equal(descriptor, 99);
+      assert.deepEqual(options, { bigint: true });
+      return opened;
+    },
+    closeSync(descriptor) {
+      calls.push("close");
+      assert.equal(descriptor, 99);
+    },
+  };
+}
+
+test("Windows open returns the descriptor when every identity matches", () => {
+  const api = scriptedFs({ before: fakeStat(), opened: fakeStat(), after: fakeStat() });
+  assert.equal(openWindowsInputDescriptor("input.json", api), 99);
+  assert.deepEqual(api.calls, ["lstat", "open", "fstat", "lstat"]);
+});
+
+for (const [name, script] of [
+  ["a swap between the lstat and the open", { before: fakeStat(), opened: fakeStat({ ino: 43n }), after: fakeStat({ ino: 43n }) }],
+  ["a swap and restore around the open", { before: fakeStat(), opened: fakeStat({ ino: 43n }), after: fakeStat() }],
+  ["a swap right after the open", { before: fakeStat(), opened: fakeStat(), after: fakeStat({ ino: 43n }) }],
+  ["a swap to another volume", { before: fakeStat(), opened: fakeStat({ dev: 8n }), after: fakeStat({ dev: 8n }) }],
+  ["a link that appears after the open", { before: fakeStat(), opened: fakeStat(), after: fakeStat({ link: true }) }],
+  ["a filesystem that reports no file index", { before: fakeStat({ ino: 0n }), opened: fakeStat({ ino: 0n }), after: fakeStat({ ino: 0n }) }],
+]) {
+  test(`Windows open rejects ${name} and closes the descriptor`, () => {
+    const api = scriptedFs(script);
+    assert.throws(() => openWindowsInputDescriptor("input.json", api), /input changed while it was opened/);
+    assert.deepEqual(api.calls, ["lstat", "open", "fstat", "lstat", "close"]);
+  });
+}
+
+test("Windows open rejects a link or non-regular path before opening it", () => {
+  const link = scriptedFs({ before: fakeStat({ link: true }) });
+  assert.throws(() => openWindowsInputDescriptor("input.json", link), /input must not be a symlink/);
+  assert.deepEqual(link.calls, ["lstat"]);
+  const device = scriptedFs({ before: fakeStat({ file: false }) });
+  assert.throws(() => openWindowsInputDescriptor("input.json", device), /input must be a regular file/);
+  assert.deepEqual(device.calls, ["lstat"]);
 });

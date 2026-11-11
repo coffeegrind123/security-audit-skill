@@ -6,7 +6,7 @@ Select attack classes relevant to the application type. Not every class applies 
 
 Use `confirmed` only when source evidence and bounded validation establish the full boundary and meaningful result. Use `needs_validation` when a specific deployment, provider, platform, identity, or runtime fact is unavailable; state the missing fact and the safe owner-observed or local check that resolves it.
 
-> **Native / binary / kernel targets** (C/C++/Rust-unsafe, kernel modules, parsers and decoders, FFI, concurrent runtimes, binary loaders, JITs, firmware): use the memory-safety, integer/ABI, concurrency, binary-loader, and privileged-interface classes in [MEMORY-SAFETY-AND-BINARY.md](MEMORY-SAFETY-AND-BINARY.md).
+> **Native / binary / kernel targets** (C/C++/Rust-unsafe, kernel modules, parsers and decoders, FFI, concurrent runtimes, interpreter hosts that reuse workers across requests, binary loaders, JITs, firmware): use the memory-safety, integer/ABI, concurrency, binary-loader, and privileged-interface classes in [MEMORY-SAFETY-AND-BINARY.md](MEMORY-SAFETY-AND-BINARY.md).
 >
 > **AI / LLM / agent targets** (chatbots, RAG, persistent memory, tool-calling agents, MCP servers/clients, prompt assembly, or model-controlled actions): use the context, memory-poisoning, action-binding, tool-schema, MCP-identity, and output classes in [AI-AND-LLM.md](AI-AND-LLM.md).
 >
@@ -25,6 +25,10 @@ Use `confirmed` only when source evidence and bounded validation establish the f
 > **Data-isolation and lifecycle targets** (multi-tenant stores, caches/search, object links, analytics, export/backup, migration, deletion, retention, or restore): use [DATA-ISOLATION-AND-LIFECYCLE.md](DATA-ISOLATION-AND-LIFECYCLE.md).
 >
 > **Desktop, mobile, and local-IPC targets** (native apps, deep links, webview bridges, exported components, privileged helpers, local daemons, Unix sockets/XPC/Binder/D-Bus): use [DESKTOP-MOBILE-AND-LOCAL-IPC.md](DESKTOP-MOBILE-AND-LOCAL-IPC.md).
+>
+> **Cryptography and key-management targets** (encryption at rest or in transit, signature and MAC schemes, cryptographic randomness, password hashing, token generation, TLS/certificate verification, key exchange, or secret lifecycle): use the cipher-mode, randomness/KDF, signature/MAC, TLS-validation, and key-lifecycle classes in [CRYPTOGRAPHY-AND-KEY-MANAGEMENT.md](CRYPTOGRAPHY-AND-KEY-MANAGEMENT.md).
+
+> **Android targets** (source-visible Android components, content URIs, intents, Binder, WebViews, or device lifecycle in Kotlin, Java, Compose, or hybrid apps): use [ANDROID.md](ANDROID.md) for Android-specific boundaries alongside the relevant desktop/mobile, client-side, or auth companion blocks.
 
 **Injection** (subagent_type: `general`)
 Trace untrusted input from entry point to dangerous sink. What counts as a "dangerous sink" depends on the application:
@@ -60,6 +64,7 @@ For complex access models, split into separate agents for auth bypass vs authori
 - Timing side-channels on secret comparison
 - Misuse of crypto primitives (ECB mode, unauthenticated encryption, static IVs, etc.)
 - What happens when crypto operations fail? Does the error path fall back to no-crypto?
+- Cryptographic algorithm, cipher mode, randomness, signature/MAC, TLS, and secret-lifecycle classes — covered by the [CRYPTOGRAPHY-AND-KEY-MANAGEMENT.md](CRYPTOGRAPHY-AND-KEY-MANAGEMENT.md) companion blocks when selected
 
 **Business logic** (subagent_type: `general`)
 Hunt logic errors by hand: standard scanners cannot find them, and they yield high-impact findings. For each major workflow:
@@ -100,7 +105,7 @@ Use these starting points, but do not limit yourself to them:
 - What happens if you use the API in a way the frontend never would? The UI constrains users, but the API does not. What API calls are possible but never made by the client?
 - Are there any hidden or undocumented endpoints, parameters, headers, or features? Look at route registrations, middleware, and config for things that are not in the docs.
 - What happens when you mix features that were not designed to work together? Localization + preview + caching. Import + plugins + webhooks. OAuth + impersonation + API keys.
-- Is there anything interesting in the git history? Reverted security fixes, commented-out auth checks, secrets that were committed then removed (still in history).
+- Is there anything interesting in the git history? Reverted security fixes, commented-out auth checks, secrets that were committed then removed (still in history). Inspect history with neutralized `git` or a clean clone (see `EXECUTION-SAFETY.md`): `git log -p`/`git show` on the target's own `.git` run any `textconv` driver the target configured.
 - Which valid-account actions affect other users, shared integrity, availability, or operator-owned cost? Verify containment, quotas, authorization, and recovery around those actions.
 - Which operations are irreversible or require elevated confirmation? Bind authorization and approval to the final principal, action, and resource.
 - What assumptions does the code make about the environment? That the database is local, that the clock is accurate, that DNS is trustworthy, that the filesystem is case-sensitive?

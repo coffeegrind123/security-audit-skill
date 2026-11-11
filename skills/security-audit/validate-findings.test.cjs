@@ -9,16 +9,19 @@ const {
   LIMITS,
   collect,
   collectSchemaErrors,
+  openWindowsInputDescriptor,
+  sameFileIdentity,
   validateDocument,
 } = require("./validate-findings.cjs");
 
 const validatorPath = path.join(__dirname, "validate-findings.cjs");
 const CLI_TIMEOUT_MS = 5000;
 const HOSTILE_CLI_TIMEOUT_MS = 15000;
-const HAS_SAFE_INPUT_OPEN = Number.isInteger(fs.constants.O_NOFOLLOW) &&
+// Windows has no O_NOFOLLOW or O_NONBLOCK; the validators use an identity-checked open there.
+const HAS_SAFE_INPUT_OPEN = process.platform === "win32" || (Number.isInteger(fs.constants.O_NOFOLLOW) &&
   fs.constants.O_NOFOLLOW !== 0 &&
   Number.isInteger(fs.constants.O_NONBLOCK) &&
-  fs.constants.O_NONBLOCK !== 0;
+  fs.constants.O_NONBLOCK !== 0);
 const TERMINAL_CONTROL_PAYLOAD = "\u001b\u0007\u0085\u202e\u034f\ufe0f";
 const TERMINAL_CONTROL_BYTES = [
   Buffer.from([0x1b]),
@@ -29,12 +32,14 @@ const TERMINAL_CONTROL_BYTES = [
   Buffer.from("\ufe0f"),
 ];
 
-function source(kind = "entrypoint", file = "src/handler.c", line = 10) {
-  return { kind, file, line, scope: "handle", description: "Attacker data reaches the operation." };
+const DEFAULT_QUOTE = "apply_change(object, request->changes);";
+
+function source(kind = "entrypoint", file = "src/handler.c", line = 10, quote = DEFAULT_QUOTE) {
+  return { kind, file, line, quote, scope: "handle", description: "Attacker data reaches the operation." };
 }
 
-function evidence(file = "src/handler.c", line = 10) {
-  return { file, line, description: "The source performs the operation without the required check." };
+function evidence(file = "src/handler.c", line = 10, quote = DEFAULT_QUOTE) {
+  return { file, line, quote, description: "The source performs the operation without the required check." };
 }
 
 function confirmed() {
@@ -99,12 +104,12 @@ function errorsFor(value) {
 }
 
 function runCli(contents, options = {}) {
-  const { nodeArgs = [], timeout = CLI_TIMEOUT_MS } = options;
+  const { nodeArgs = [], args = (findingsPath) => [findingsPath], timeout = CLI_TIMEOUT_MS } = options;
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-"));
   const findingsPath = path.join(directory, "findings.json");
   try {
     fs.writeFileSync(findingsPath, contents);
-    return spawnSync(process.execPath, [...nodeArgs, validatorPath, findingsPath], {
+    return spawnSync(process.execPath, [...nodeArgs, validatorPath, ...args(findingsPath)], {
       encoding: "utf8",
       timeout,
     });
@@ -148,6 +153,56 @@ function rejectMutation(factory, mutate) {
   assert.notEqual(errorsFor([value]).length, 0);
 }
 
+// A small target tree for --target quote checks. Every line ends with LF except in crlf.c.
+const TARGET_FILES = {
+  "LICENSE": "MIT License\n",
+  "skills/security-audit/report-schema.json": [
+    "{",
+    "  \"$comment\": \"Top-level contract for findings.json.\",",
+    "  \"type\": \"array\",",
+    "",
+  ].join("\n"),
+  "src/crlf.c": "int main(void) {\r\n  return run();\r\n}\r\n",
+  "src/db.js": [
+    "const db = require(\"./pool\");",
+    "",
+    "function getUser(req, res) {",
+    "  const sql = \"SELECT * FROM users WHERE id = \" + req.query.id;",
+    "  return db.query(sql);",
+    "}",
+    "",
+  ].join("\n"),
+  "src/menu.txt": "caf\u00e9 au lait\n",
+};
+
+function withTarget(callback) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-target-"));
+  const root = path.join(directory, "target");
+  try {
+    for (const [name, contents] of Object.entries(TARGET_FILES)) {
+      const filePath = path.join(root, ...name.split("/"));
+      fs.mkdirSync(path.dirname(filePath), { recursive: true });
+      fs.writeFileSync(filePath, contents);
+    }
+    return callback(root, directory);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+// One finding whose trace[0] is the citation under test. Its evidence cites a real
+// target line, so every reported error belongs to trace[0].
+function citing(file, line, quote) {
+  const finding = rejected();
+  finding.trace = [source("sink", file, line, quote)];
+  finding.evidence = [evidence("src/db.js", 5, "return db.query(sql);")];
+  return [finding];
+}
+
+function targetErrorsFor(root, file, line, quote) {
+  return validateDocument(citing(file, line, quote), schema, { target: root });
+}
+
 test("schema is an actual top-level array with exactly three branches", () => {
   assert.equal(schema.type, "array");
   assert.equal(schema.items.oneOf.length, 3);
@@ -161,7 +216,18 @@ test("schema is an actual top-level array with exactly three branches", () => {
   assert.equal(confirmedSchema.remediation.properties.code_changes.items.properties.fixed_code.minLength, undefined);
 });
 
-test("accepts a producer-shaped findings document through the CLI", () => {
+test("accepts a producer-shaped findings document in memory", () => {
+  assert.deepEqual(errorsFor(producerShapedFindings()), []);
+});
+
+test("CLI fails closed when safe input opening is unavailable", { skip: HAS_SAFE_INPUT_OPEN }, () => {
+  const result = runCli("[]");
+  assert.equal(result.status, 1, cliOutput(result));
+  assert.match(result.stderr, /OS no-follow and nonblocking input protection is unavailable/);
+  assert.doesNotMatch(cliOutput(result), /PASS:|\n\s+at /);
+});
+
+test("accepts a producer-shaped findings document through the CLI", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const result = runCli(JSON.stringify(producerShapedFindings()));
   assert.equal(result.status, 0, cliOutput(result));
   assert.match(result.stdout, /PASS: 3 findings valid/);
@@ -182,6 +248,33 @@ test("allows a one-line finding trace", () => {
   const finding = confirmed();
   finding.trace = [source("entrypoint")];
   assert.deepEqual(errorsFor([finding]), []);
+});
+
+test("bounds source line numbers from above", () => {
+  // The schema only bounds `line` from below, and Number.isInteger is true for
+  // 1e21 and 1e308, so without an upper bound a finding can claim a line no
+  // file has and JSON re-serializes it in exponential form.
+  for (const line of [LIMITS.sourceLine + 1, Number.MAX_SAFE_INTEGER, 1e21, 1e308]) {
+    rejectMutation(confirmed, (finding) => { finding.trace[0].line = line; });
+    rejectMutation(confirmed, (finding) => { finding.evidence[0].line = line; });
+  }
+});
+
+test("allows source line numbers up to the limit", () => {
+  for (const line of [1, 2, LIMITS.sourceLine]) {
+    const finding = confirmed();
+    finding.trace[0].line = line;
+    finding.evidence[0].line = line;
+    assert.deepEqual(errorsFor([finding]), []);
+  }
+});
+
+test("a bounded line number survives a JSON round trip as an integer", () => {
+  const finding = confirmed();
+  finding.trace[0].line = LIMITS.sourceLine;
+  assert.deepEqual(errorsFor([finding]), []);
+  assert.equal(JSON.stringify(finding.trace[0].line), String(LIMITS.sourceLine));
+  assert.ok(!JSON.stringify(finding.trace[0].line).includes("e"));
 });
 
 test("rejects empty required content", () => {
@@ -302,6 +395,12 @@ test("bounds canonical uniqueness keys and Set storage", () => {
     .some((error) => error.includes("canonical uniqueness set exceeds")));
 });
 
+test("rejects an oversized object in the parsed document", () => {
+  const finding = confirmed();
+  finding.extra = Object.fromEntries(Array.from({ length: LIMITS.objectFields + 1 }, (_, index) => [`k${index}`, null]));
+  assert(errorsFor([finding]).some((error) => error.includes(`exceeds ${LIMITS.objectFields} object fields`)));
+});
+
 test("requires findings to be sorted by fingerprint", () => {
   const first = confirmed();
   const second = rejected();
@@ -372,7 +471,198 @@ test("accepts legitimate Unicode source paths and prose", () => {
   assert.deepEqual(errorsFor([finding]), []);
 });
 
-test("CLI rejects input above the byte limit without an exception trace", () => {
+test("rejects a cited location without a quote in every verdict branch", () => {
+  // Issue #134: this fabricated record cites real files and lines but no source bytes.
+  const fabricated = confirmed();
+  fabricated.trace = [
+    source("entrypoint", "skills/security-audit/report-schema.json", 1),
+    source("propagation", "skills/security-audit/report-schema.json", 2),
+    source("sink", "skills/security-audit/report-schema.json", 3),
+  ];
+  fabricated.evidence = [evidence("LICENSE", 1)];
+  for (const entry of [...fabricated.trace, ...fabricated.evidence]) delete entry.quote;
+  const errors = errorsFor([fabricated]);
+  for (const location of ["trace[0]", "trace[1]", "trace[2]", "evidence[0]"]) {
+    assert(errors.includes(`$[0].${location}: missing required field "quote"`), errors.join("\n"));
+  }
+
+  for (const factory of [confirmed, needsValidation, rejected]) {
+    for (const field of ["trace", "evidence"]) {
+      const finding = factory();
+      delete finding[field][0].quote;
+      assert(errorsFor([finding]).includes(`$[0].${field}[0]: missing required field "quote"`), `${finding.verdict} ${field}`);
+    }
+  }
+});
+
+test("requires a visible quote and preserves its exact bytes", () => {
+  for (const invalid of ["", " \t\r\n", "\u200b", "\ufe0f", "visible\ud800", 42, null]) {
+    for (const factory of [confirmed, needsValidation, rejected]) {
+      const finding = factory();
+      finding.evidence[0].quote = invalid;
+      assert(errorsFor([finding]).some((error) => error.startsWith("$[0].evidence[0].quote: ")),
+        `${finding.verdict} ${JSON.stringify(invalid)}`);
+    }
+  }
+
+  const finding = confirmed();
+  const exact = "\tif (!is_owner(user, object))  \r\n\t\treturn apply(object);\u0000";
+  finding.trace[0].quote = exact;
+  assert.deepEqual(errorsFor([finding]), []);
+  assert.equal(finding.trace[0].quote, exact);
+});
+
+test("checks only quote shape and reads no file without a target", () => {
+  const finding = rejected();
+  finding.trace = [source("sink", "src/not-in-any-checkout.c", 99999, "forged_call(user_input);")];
+  assert.deepEqual(errorsFor([finding]), []);
+});
+
+test("accepts a quote that begins on the cited line of the target file", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const cases = [
+      ["src/db.js", 3, "function getUser(req, res) {"],
+      ["src/db.js", 4, "req.query.id"],
+      ["src/db.js", 4, "  const sql = \"SELECT * FROM users WHERE id = \" + req.query.id;\n  return db.query(sql);\n}"],
+      ["src/db.js", 4, "req.query.id;\n  return db.query(sql);"],
+      ["src/db.js", 2, "\nfunction getUser(req, res) {"],
+      ["src/db.js", 6, "}\n"],
+      ["src/crlf.c", 1, "int main(void) {\r\n  return run();"],
+      ["src/menu.txt", 1, "caf\u00e9"],
+    ];
+    for (const [file, line, quote] of cases) {
+      assert.deepEqual(targetErrorsFor(root, file, line, quote), [], `${file}:${line} ${JSON.stringify(quote)}`);
+    }
+  });
+});
+
+test("rejects a forged quote or one that does not begin on the cited line", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const cases = [
+      // Absent from the file.
+      ["src/db.js", 5, "return db.query(\"SELECT * FROM users WHERE id = ?\", [req.query.id]);"],
+      // Present, but on line 5 rather than the cited line 4.
+      ["src/db.js", 4, "return db.query(sql);"],
+      // Begins on line 4, before the cited line 5.
+      ["src/db.js", 5, "req.query.id;\n  return db.query(sql);"],
+      // Begins on line 3, after the empty cited line 2.
+      ["src/db.js", 2, "function getUser(req, res) {"],
+      // Runs past the bytes of the cited line.
+      ["src/db.js", 5, "return db.query(sql); // parameterized"],
+      // Reindents a continuation line.
+      ["src/db.js", 4, "const sql = \"SELECT * FROM users WHERE id = \" + req.query.id;\nreturn db.query(sql);"],
+      // Uses LF where the file has CRLF.
+      ["src/crlf.c", 1, "int main(void) {\n  return run();"],
+      // Canonically equivalent text with different bytes.
+      ["src/menu.txt", 1, "cafe\u0301"],
+    ];
+    for (const [file, line, quote] of cases) {
+      assert.deepEqual(targetErrorsFor(root, file, line, quote), [
+        `$[0].trace[0].quote: must match the bytes of ${JSON.stringify(file)} starting on line ${line}`,
+      ], `${file}:${line} ${JSON.stringify(quote)}`);
+    }
+    for (const line of [7, LIMITS.sourceLine]) {
+      assert.deepEqual(targetErrorsFor(root, "src/db.js", line, "}"), [
+        "$[0].trace[0].line: exceeds the last line of \"src/db.js\"",
+      ], `line ${line}`);
+    }
+  });
+});
+
+test("rejects the issue 134 fabricated finding when its quotes are forged", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const schemaPath = "skills/security-audit/report-schema.json";
+    const fabricated = confirmed();
+    fabricated.trace = [
+      source("entrypoint", schemaPath, 1, "app.get(\"/users\", getUser);"),
+      source("propagation", schemaPath, 2, "const sql = \"SELECT * FROM users WHERE id = \" + req.query.id;"),
+      source("sink", schemaPath, 3, "return db.query(sql);"),
+    ];
+    fabricated.evidence = [evidence("LICENSE", 1, "db.query(sql)")];
+    assert.deepEqual(validateDocument([fabricated], schema, { target: root }), [
+      `$[0].trace[0].quote: must match the bytes of "${schemaPath}" starting on line 1`,
+      `$[0].trace[1].quote: must match the bytes of "${schemaPath}" starting on line 2`,
+      `$[0].trace[2].quote: must match the bytes of "${schemaPath}" starting on line 3`,
+      "$[0].evidence[0].quote: must match the bytes of \"LICENSE\" starting on line 1",
+    ]);
+  });
+});
+
+test("reads no cited file outside the target", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root, directory) => {
+    const outsideFile = path.join(directory, "outside.js");
+    fs.writeFileSync(outsideFile, "return db.query(sql);\n");
+    for (const file of ["../outside.js", "src/../../outside.js", outsideFile]) {
+      assert.deepEqual(targetErrorsFor(root, file, 1, "return db.query(sql);"), [
+        "$[0].trace[0].file: must be a safe repository-relative source path",
+      ], file);
+    }
+  });
+});
+
+test("refuses a cited file that is or passes through a symlink", { skip: process.platform === "win32" || !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root, directory) => {
+    const outside = path.join(directory, "outside");
+    fs.mkdirSync(outside);
+    fs.writeFileSync(path.join(outside, "secret.js"), "return db.query(sql);\n");
+    fs.symlinkSync(path.join(outside, "secret.js"), path.join(root, "src", "escape.js"));
+    fs.symlinkSync(outside, path.join(root, "vendor"));
+    fs.symlinkSync("db.js", path.join(root, "src", "alias.js"));
+    for (const [file, line] of [["src/escape.js", 1], ["vendor/secret.js", 1], ["src/alias.js", 5]]) {
+      assert.deepEqual(targetErrorsFor(root, file, line, "return db.query(sql);"), [
+        "$[0].trace[0].file: cited file must not be or pass through a symlink",
+      ], file);
+    }
+  });
+});
+
+test("bounds the total bytes read and searched for quotes", { skip: process.platform === "win32" || !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const limitError = `$: quote checks exceed ${LIMITS.quoteCheckBytes} byte limit`;
+    const findingsFor = (citations) => citations.map(([file, quote], index) => {
+      const [finding] = citing(file, 1, quote);
+      finding.fingerprint = `bounded-${String(index).padStart(4, "0")}`;
+      return finding;
+    });
+
+    // Repeated searches of one long line: each quote matches only at the line's end.
+    const lineBytes = 16 * 1024 * 1024;
+    fs.writeFileSync(path.join(root, "src", "bundle.min.js"), `${"x".repeat(lineBytes - 3)}END`);
+    const searches = Array.from({ length: LIMITS.quoteCheckBytes / lineBytes }, (_, index) =>
+      ["src/bundle.min.js", `${"x".repeat(index + 1)}END`]);
+    assert.deepEqual(validateDocument(findingsFor(searches), schema, { target: root }), [limitError]);
+
+    // Repeated reads of one large sparse file through hard links, each citing a short line.
+    const large = path.join(root, "src", "large.bin");
+    fs.writeFileSync(large, "x\n");
+    fs.truncateSync(large, LIMITS.sourceFileBytes);
+    const reads = Array.from({ length: LIMITS.quoteCheckBytes / LIMITS.sourceFileBytes + 1 }, (_, index) => {
+      const link = `src/link-${index}.bin`;
+      fs.linkSync(large, path.join(root, ...link.split("/")));
+      return [link, "x"];
+    });
+    assert.deepEqual(validateDocument(findingsFor(reads), schema, { target: root }), [limitError]);
+  });
+});
+
+test("reports a missing, non-regular, or oversized cited file", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const oversized = path.join(root, "src", "oversized.js");
+    fs.writeFileSync(oversized, "");
+    fs.truncateSync(oversized, LIMITS.sourceFileBytes + 1);
+    const cases = [
+      ["src/missing.js", "cited file does not exist in the target"],
+      ["src/db.js/child.js", "cited file does not exist in the target"],
+      ["src", "cited file must be a regular file"],
+      ["src/oversized.js", `cited file exceeds ${LIMITS.sourceFileBytes} byte limit`],
+    ];
+    for (const [file, message] of cases) {
+      assert.deepEqual(targetErrorsFor(root, file, 1, "return db.query(sql);"), [`$[0].trace[0].file: ${message}`], file);
+    }
+  });
+});
+
+test("CLI rejects input above the byte limit without an exception trace", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const result = runCli(Buffer.alloc(LIMITS.inputBytes + 1, 0x20));
   const output = cliOutput(result);
   assert.equal(result.status, 1, output);
@@ -380,7 +670,7 @@ test("CLI rejects input above the byte limit without an exception trace", () => 
   assert.doesNotMatch(output, /RangeError|Maximum call stack|heap out of memory/i);
 });
 
-test("CLI rejects invalid UTF-8 without replacement or an exception trace", () => {
+test("CLI rejects invalid UTF-8 without replacement or an exception trace", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const findings = producerShapedFindings();
   findings[0].execution.payloads = ["INVALID_UTF8"];
   const encoded = Buffer.from(JSON.stringify(findings));
@@ -442,7 +732,7 @@ test("does not reflect controls from a failed CLI input path", () => {
   }
 });
 
-test("CLI rejects lone-surrogate prose without changing payload semantics", () => {
+test("CLI rejects lone-surrogate prose without changing payload semantics", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const findings = producerShapedFindings();
   findings[0].title = "\ud800";
   const result = runCli(JSON.stringify(findings));
@@ -452,7 +742,7 @@ test("CLI rejects lone-surrogate prose without changing payload semantics", () =
   assert.doesNotMatch(output, /stack|at validate-findings/i);
 });
 
-test("CLI rejects Unicode format controls in source paths", () => {
+test("CLI rejects Unicode format controls in source paths", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const findings = producerShapedFindings();
   findings[0].trace[0].file = "src/file\u202ename.c";
   const result = runCli(JSON.stringify(findings));
@@ -504,7 +794,119 @@ test("CLI rejects a symlink without following it", { skip: process.platform === 
   }
 });
 
-test("CLI rejects input above the nesting-depth limit without an exception trace", () => {
+test("CLI checks quotes against the --target source", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const targetArgs = { args: (findingsPath) => [findingsPath, "--target", root] };
+    const exact = JSON.stringify(citing("src/db.js", 5, "return db.query(sql);"));
+    const forged = JSON.stringify(citing("src/db.js", 5, "return db.query(\"SELECT * FROM users WHERE id = ?\", [id]);"));
+
+    const passed = runCli(exact, targetArgs);
+    assert.equal(passed.status, 0, cliOutput(passed));
+    assert.match(passed.stdout, /PASS: 1 findings valid/);
+
+    const failed = runCli(forged, targetArgs);
+    assert.equal(failed.status, 1, cliOutput(failed));
+    assert.match(failed.stderr, /ERROR: \$\[0\]\.trace\[0\]\.quote: must match the bytes of "src\/db\.js" starting on line 5/);
+    assert.match(failed.stderr, /FAIL: 1 validation error\(s\)/);
+
+    // Without --target the validator checks only that each quote is present and visible.
+    const shapeOnly = runCli(forged);
+    assert.equal(shapeOnly.status, 0, cliOutput(shapeOnly));
+  });
+});
+
+test("CLI also accepts --target before the findings path", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const targetFirst = { args: (findingsPath) => ["--target", root, findingsPath] };
+    const exact = JSON.stringify(citing("src/db.js", 5, "return db.query(sql);"));
+    const forged = JSON.stringify(citing("src/db.js", 5, "return db.query(\"SELECT * FROM users WHERE id = ?\", [id]);"));
+
+    const passed = runCli(exact, targetFirst);
+    assert.equal(passed.status, 0, cliOutput(passed));
+    assert.match(passed.stdout, /PASS: 1 findings valid/);
+
+    const failed = runCli(forged, targetFirst);
+    assert.equal(failed.status, 1, cliOutput(failed));
+    assert.match(failed.stderr, /ERROR: \$\[0\]\.trace\[0\]\.quote: must match the bytes of "src\/db\.js" starting on line 5/);
+  });
+});
+
+test("CLI refuses malformed --target arguments instead of skipping quote checks", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const forged = JSON.stringify(citing("src/db.js", 5, "return db.query(\"SELECT * FROM users WHERE id = ?\", [id]);"));
+    const usage = /^Usage: node validate-findings\.cjs <path-to-findings\.json> \[--target <target-dir>\]$/m;
+    for (const args of [
+      (findingsPath) => [findingsPath, "--target"],
+      (findingsPath) => [findingsPath, "--target", root, "--target", root],
+      (findingsPath) => [findingsPath, "--taget", root],
+      (findingsPath) => [findingsPath, "--target", root, findingsPath],
+      () => ["--target", root],
+    ]) {
+      const result = runCli(forged, { args });
+      assert.equal(result.status, 1, cliOutput(result));
+      assert.match(result.stderr, usage);
+      assert.equal(result.stdout, "");
+    }
+    for (const target of [path.join(root, "missing"), path.join(root, "src", "db.js")]) {
+      const result = runCli(forged, { args: (findingsPath) => [findingsPath, "--target", target] });
+      assert.equal(result.status, 1, cliOutput(result));
+      assert.equal(result.stderr, "Failed to read target: target must be an existing directory\n");
+    }
+  });
+});
+
+test("CLI rejects a cited FIFO without blocking", { skip: process.platform === "win32" || !HAS_SAFE_INPUT_OPEN }, () => {
+  withTarget((root) => {
+    const created = spawnSync("mkfifo", [path.join(root, "src", "pipe")], { encoding: "utf8", timeout: CLI_TIMEOUT_MS });
+    assert.equal(created.status, 0, cliOutput(created));
+    const result = runCli(JSON.stringify(citing("src/pipe", 1, "return db.query(sql);")), {
+      args: (findingsPath) => [findingsPath, "--target", root],
+    });
+    const output = cliOutput(result);
+    assert.notEqual(result.error && result.error.code, "ETIMEDOUT", output);
+    assert.equal(result.status, 1, output);
+    assert.match(output, /\$\[0\]\.trace\[0\]\.file: cited file must be a regular file/);
+    assert.doesNotMatch(output, /stack|at validate-findings/i);
+  });
+});
+
+// Every verdict is checked, not only confirmed: a forged needs_validation record wastes
+// owner time, and a forged rejected record can suppress a real claim in later runs.
+function assertTargetChecksQuotes(finding) {
+  withTarget((root) => {
+    const targetArgs = { args: (findingsPath) => [findingsPath, "--target", root] };
+    finding.trace = [source("sink", "src/db.js", 5, "return db.query(sql);")];
+    finding.evidence = [evidence("src/db.js", 4, "req.query.id")];
+    const passed = runCli(JSON.stringify([finding]), targetArgs);
+    assert.equal(passed.status, 0, cliOutput(passed));
+    assert.match(passed.stdout, /PASS: 1 findings valid/);
+
+    finding.trace[0].quote = "return db.query(\"SELECT * FROM users WHERE id = ?\", [id]);";
+    finding.evidence[0].file = "src/never-existed.c";
+    const failed = runCli(JSON.stringify([finding]), targetArgs);
+    assert.equal(failed.status, 1, cliOutput(failed));
+    assert.equal(failed.stderr, [
+      "ERROR: $[0].trace[0].quote: must match the bytes of \"src/db.js\" starting on line 5",
+      "ERROR: $[0].evidence[0].file: cited file does not exist in the target",
+      "FAIL: 2 validation error(s)",
+      "",
+    ].join("\n"));
+  });
+}
+
+test("--target checks quotes in rejected records too", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const finding = rejected();
+  assert.equal(finding.verdict, "rejected");
+  assertTargetChecksQuotes(finding);
+});
+
+test("--target checks quotes in needs_validation records too", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const finding = needsValidation();
+  assert.equal(finding.verdict, "needs_validation");
+  assertTargetChecksQuotes(finding);
+});
+
+test("CLI rejects input above the nesting-depth limit without an exception trace", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const levels = LIMITS.nestingDepth + 1;
   const result = runCli(`${"[".repeat(levels)}0${"]".repeat(levels)}`);
   const output = cliOutput(result);
@@ -513,12 +915,70 @@ test("CLI rejects input above the nesting-depth limit without an exception trace
   assert.doesNotMatch(output, /RangeError|Maximum call stack|heap out of memory/i);
 });
 
-test("CLI rejects an oversized array without an exception trace", () => {
+test("CLI rejects an oversized array without an exception trace", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
   const result = runCli(JSON.stringify(Array(LIMITS.arrayItems + 1).fill(null)));
   const output = cliOutput(result);
   assert.equal(result.status, 1, output);
   assert.match(output, new RegExp(`${LIMITS.arrayItems} item array limit`));
   assert.doesNotMatch(output, /RangeError|Maximum call stack|heap out of memory/i);
+});
+
+test("CLI rejects duplicate object keys instead of keeping the last one", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const valid = JSON.stringify([rejected()]);
+  assert.equal(runCli(valid).status, 0, cliOutput(runCli(valid)));
+
+  for (const duplicate of [
+    "\"verdict\":\"needs_validation\",\"verdict\":",
+    "\"verd\\u0069ct\":\"needs_validation\",\"verdict\":",
+  ]) {
+    const result = runCli(valid.replace("\"verdict\":", duplicate));
+    assert.equal(result.status, 1, cliOutput(result));
+    assert.match(result.stderr, /duplicate object key "verdict"/);
+  }
+
+  const nested = runCli(valid.replace("\"line\":10", "\"line\":0,\"line\":10"));
+  assert.equal(nested.status, 1, cliOutput(nested));
+  assert.match(nested.stderr, /duplicate object key "line"/);
+
+  const control = runCli(valid.replace("\"reason\":", `"x\\u001b":1,"x\\u001b":1,"reason":`));
+  assert.equal(control.status, 1, cliOutput(control));
+  assert.match(control.stderr, /\\u001b/);
+  assertNoInjectedControlBytes(control.stderr);
+});
+
+test("CLI keeps distinct decoded keys and identical keys in separate objects", { skip: !HAS_SAFE_INPUT_OPEN }, () => {
+  const finding = confirmed();
+  finding.execution.payloads = [{}];
+  const separateObjects = JSON.stringify([finding]);
+  const result = runCli(separateObjects.replace("[{}]", "[{\"a\":1,\"A\":1,\"\\u00e9\":1,\"e\\u0301\":1}]"));
+  assert.equal(result.status, 1, cliOutput(result));
+  assert.doesNotMatch(result.stderr, /duplicate object key/);
+  assert.match(result.stderr, /payloads\[0\]: expected string/);
+
+  const findings = [rejected(), { ...rejected(), fingerprint: "src-router-auth-bypass-2" }];
+  const sameKeys = runCli(JSON.stringify(findings));
+  assert.equal(sameKeys.status, 0, cliOutput(sameKeys));
+});
+
+test("CLI rejects an oversized object without an exception trace", () => {
+  const fields = Array.from({ length: LIMITS.objectFields + 1 }, (_, index) => `"field${index}":null`);
+  const result = runCli(`[{${fields.join(",")}}]`);
+  const output = cliOutput(result);
+  assert.equal(result.status, 1, output);
+  assert.match(output, new RegExp(`${LIMITS.objectFields} field object limit`));
+  assert.doesNotMatch(output, /RangeError|Maximum call stack|heap out of memory/i);
+});
+
+test("CLI boundary object at the field limit reaches schema validation", () => {
+  const fields = [
+    "\"verdict\":\"confirmed\"",
+    ...Array.from({ length: LIMITS.objectFields - 1 }, (_, index) => `"field${index}":null`),
+  ];
+  const result = runCli(`[{${fields.join(",")}}]`);
+  const output = cliOutput(result);
+  assert.equal(result.status, 1, output);
+  assert.match(output, /unexpected field/);
+  assert.doesNotMatch(output, /field object limit/);
 });
 
 test("checks pattern and branch invariants", () => {
@@ -588,7 +1048,7 @@ test("keeps shared helpers aligned with the coverage-ledger validator", () => {
   const sharedLimitKeys = Object.keys(findingsModule.LIMITS)
     .filter((key) => Object.prototype.hasOwnProperty.call(ledgerModule.LIMITS, key))
     .sort();
-  assert.deepEqual(sharedLimitKeys, ["inputBytes", "nestingDepth", "validationErrors"]);
+  assert.deepEqual(sharedLimitKeys, ["inputBytes", "nestingDepth", "objectFields", "validationErrors"]);
   for (const key of sharedLimitKeys) {
     assert.equal(findingsModule.LIMITS[key], ledgerModule.LIMITS[key], `LIMITS.${key}`);
   }
@@ -649,4 +1109,146 @@ test("keeps shared helpers aligned with the coverage-ledger validator", () => {
       `prose verdict diverges for ${JSON.stringify(value)}`,
     );
   }
+});
+
+test("sameFileIdentity matches only an equal, reported volume and file index", () => {
+  const base = { dev: 7n, ino: 42n };
+  assert.equal(sameFileIdentity(base, { dev: 7n, ino: 42n }), true);
+  assert.equal(sameFileIdentity(base, { dev: 8n, ino: 42n }), false);
+  assert.equal(sameFileIdentity(base, { dev: 7n, ino: 43n }), false);
+  assert.equal(sameFileIdentity({ dev: 7n, ino: 0n }, { dev: 7n, ino: 0n }), false);
+});
+
+function windowsCliRun(inputPath) {
+  const result = spawnSync(process.execPath, [validatorPath, inputPath], {
+    encoding: "utf8",
+    timeout: CLI_TIMEOUT_MS,
+  });
+  const output = cliOutput(result);
+  assert.notEqual(result.error && result.error.code, "ETIMEDOUT", output);
+  assert.equal(result.status, 1, output);
+  assert.doesNotMatch(output, /stack|at validate-findings/i);
+  return output;
+}
+
+test("Windows: accepts a regular file through the identity-checked open", { skip: process.platform !== "win32" }, () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-win-regular-"));
+  const inputPath = path.join(directory, "input.json");
+  try {
+    fs.writeFileSync(inputPath, JSON.stringify(producerShapedFindings()));
+    const result = spawnSync(process.execPath, [validatorPath, inputPath], {
+      encoding: "utf8",
+      timeout: CLI_TIMEOUT_MS,
+    });
+    const output = cliOutput(result);
+    assert.equal(result.status, 0, output);
+    assert.doesNotMatch(output, /no-follow and nonblocking input protection is unavailable/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a directory junction without following it", { skip: process.platform !== "win32" }, () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-win-junction-"));
+  const junctionPath = path.join(directory, "input.json");
+  try {
+    fs.symlinkSync(directory, junctionPath, "junction");
+    assert.match(windowsCliRun(junctionPath), /input must not be a symlink/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a file symlink without following it", { skip: process.platform !== "win32" }, (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "validate-findings-win-symlink-"));
+  const targetPath = path.join(directory, "target.json");
+  const symlinkPath = path.join(directory, "input.json");
+  try {
+    fs.writeFileSync(targetPath, JSON.stringify(producerShapedFindings()));
+    try {
+      fs.symlinkSync(targetPath, symlinkPath, "file");
+    } catch (error) {
+      if (error && error.code === "EPERM") {
+        t.skip("creating a file symlink needs Developer Mode or administrator rights");
+        return;
+      }
+      throw error;
+    }
+    assert.match(windowsCliRun(symlinkPath), /input must not be a symlink/);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test("Windows: rejects a device name without opening or blocking", { skip: process.platform !== "win32" }, () => {
+  const separator = String.fromCharCode(92);
+  const pipePath = ["", "", ".", "pipe", "validate-findings-absent"].join(separator);
+  for (const device of ["CON", "NUL", pipePath]) {
+    windowsCliRun(device);
+  }
+});
+
+// Deterministic race coverage: a scripted fs returns chosen stat results for the first
+// lstat, the fstat of the opened descriptor, and the second lstat, so each swap lands
+// at an exact step. Runs on every platform.
+function fakeStat({ dev = 7n, ino = 42n, link = false, file = true } = {}) {
+  return { dev, ino, isSymbolicLink: () => link, isFile: () => file };
+}
+
+function scriptedFs({ before, opened, after }) {
+  const calls = [];
+  let lstats = 0;
+  return {
+    calls,
+    lstatSync(file, options) {
+      calls.push("lstat");
+      assert.deepEqual(options, { bigint: true });
+      lstats += 1;
+      return lstats === 1 ? before : after;
+    },
+    openSync() {
+      calls.push("open");
+      return 99;
+    },
+    fstatSync(descriptor, options) {
+      calls.push("fstat");
+      assert.equal(descriptor, 99);
+      assert.deepEqual(options, { bigint: true });
+      return opened;
+    },
+    closeSync(descriptor) {
+      calls.push("close");
+      assert.equal(descriptor, 99);
+    },
+  };
+}
+
+test("Windows open returns the descriptor when every identity matches", () => {
+  const api = scriptedFs({ before: fakeStat(), opened: fakeStat(), after: fakeStat() });
+  assert.equal(openWindowsInputDescriptor("input.json", api), 99);
+  assert.deepEqual(api.calls, ["lstat", "open", "fstat", "lstat"]);
+});
+
+for (const [name, script] of [
+  ["a swap between the lstat and the open", { before: fakeStat(), opened: fakeStat({ ino: 43n }), after: fakeStat({ ino: 43n }) }],
+  ["a swap and restore around the open", { before: fakeStat(), opened: fakeStat({ ino: 43n }), after: fakeStat() }],
+  ["a swap right after the open", { before: fakeStat(), opened: fakeStat(), after: fakeStat({ ino: 43n }) }],
+  ["a swap to another volume", { before: fakeStat(), opened: fakeStat({ dev: 8n }), after: fakeStat({ dev: 8n }) }],
+  ["a link that appears after the open", { before: fakeStat(), opened: fakeStat(), after: fakeStat({ link: true }) }],
+  ["a filesystem that reports no file index", { before: fakeStat({ ino: 0n }), opened: fakeStat({ ino: 0n }), after: fakeStat({ ino: 0n }) }],
+]) {
+  test(`Windows open rejects ${name} and closes the descriptor`, () => {
+    const api = scriptedFs(script);
+    assert.throws(() => openWindowsInputDescriptor("input.json", api), /input changed while it was opened/);
+    assert.deepEqual(api.calls, ["lstat", "open", "fstat", "lstat", "close"]);
+  });
+}
+
+test("Windows open rejects a link or non-regular path before opening it", () => {
+  const link = scriptedFs({ before: fakeStat({ link: true }) });
+  assert.throws(() => openWindowsInputDescriptor("input.json", link), /input must not be a symlink/);
+  assert.deepEqual(link.calls, ["lstat"]);
+  const device = scriptedFs({ before: fakeStat({ file: false }) });
+  assert.throws(() => openWindowsInputDescriptor("input.json", device), /input must be a regular file/);
+  assert.deepEqual(device.calls, ["lstat"]);
 });

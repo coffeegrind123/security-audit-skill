@@ -2,7 +2,7 @@
 
 /**
  * Validates coverage-ledger.json and its canonical coverage IDs.
- * Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json>
+ * Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json> [--terminal] [--output-dir <run-dir>]
  */
 
 const fs = require("node:fs");
@@ -56,6 +56,7 @@ const STATUSES = new Set([
   "deferred",
 ]);
 const ATTEMPT_STATUSES = new Set(["covered", "candidate", "blocked"]);
+const ASSIGNED_STATUSES = new Set(["in_progress", "covered", "candidate", "blocked"]);
 const ATTEMPT_FIELDS = [
   "wave",
   "status",
@@ -144,6 +145,7 @@ function preflightJsonText(contents) {
   let inString = false;
   let escaped = false;
   let totalValues = 0;
+  let keyStart = -1;
 
   function fail(message) {
     throw new JsonStructureError(`input ${message}`);
@@ -184,7 +186,7 @@ function preflightJsonText(contents) {
     countValue();
   }
 
-  function beginString() {
+  function beginString(quoteIndex) {
     const container = currentContainer();
     if (container && container.type === "object" &&
         (container.state === "firstKeyOrEnd" || container.state === "key")) {
@@ -193,10 +195,23 @@ function preflightJsonText(contents) {
         fail(`exceeds ${LIMITS.objectFields} field object limit`);
       }
       container.state = "colon";
+      keyStart = quoteIndex + 1;
     } else {
       beginValue();
     }
     inString = true;
+  }
+
+  function endKey(end) {
+    let key;
+    try {
+      key = JSON.parse(`"${contents.slice(keyStart, end)}"`);
+    } catch {
+      return;
+    }
+    const container = currentContainer();
+    if (container.keys.has(key)) fail(`has duplicate object key ${safeQuote(key)}`);
+    container.keys.add(key);
   }
 
   function beginContainer(type) {
@@ -206,7 +221,7 @@ function preflightJsonText(contents) {
     }
     containers.push(type === "array"
       ? { type, state: "firstValueOrEnd", items: 0, topLevel: containers.length === 0 }
-      : { type, state: "firstKeyOrEnd", fields: 0 });
+      : { type, state: "firstKeyOrEnd", fields: 0, keys: new Set() });
   }
 
   function closeContainer(type) {
@@ -238,13 +253,17 @@ function preflightJsonText(contents) {
         escaped = true;
       } else if (character === "\"") {
         inString = false;
+        if (keyStart !== -1) {
+          endKey(index);
+          keyStart = -1;
+        }
       }
       continue;
     }
     if (isWhitespace(character)) continue;
 
     if (character === "\"") {
-      beginString();
+      beginString(index);
     } else if (character === "[") {
       beginContainer("array");
     } else if (character === "{") {
@@ -516,6 +535,14 @@ function requireNonemptyArray(unit, field, base, errors) {
 }
 
 function validateStateInvariants(unit, base, errors) {
+  if (ASSIGNED_STATUSES.has(unit.status) && isObject(unit.canonical_refs)) {
+    const attackClass = unit.canonical_refs.attack_class;
+    if (typeof attackClass === "string" && attackClass.startsWith("ATTACK-CLASSES.md#") &&
+        unit.ordinary_attack_class_block !== attackClass) {
+      errors.push(`${base}.ordinary_attack_class_block: must match canonical_refs.attack_class for an assigned ordinary attack class`);
+    }
+  }
+
   const emptyEvidence = () => {
     requireEmptyArray(unit, "reviewed_paths", base, errors);
     requireEmptyArray(unit, "local_checks", base, errors);
@@ -573,6 +600,7 @@ function validateAttempts(value, unit, base, errors) {
   if (value.length > MAX_LIST_ITEMS) errors.push(`${base}.attempts: exceeds ${MAX_LIST_ITEMS} entries`);
 
   const priorOwners = new Set();
+  const priorCheckOwners = new Set();
   const priorArtifacts = new Set();
   let previousWave = 0;
   value.slice(0, MAX_LIST_ITEMS).forEach((attempt, index) => {
@@ -601,6 +629,8 @@ function validateAttempts(value, unit, base, errors) {
       errors.push(`${attemptBase}.agent_id: archived attempt requires a canonical lowercase agent ID`);
     } else if (priorOwners.has(attempt.agent_id)) {
       errors.push(`${attemptBase}.agent_id: assignment owner must be fresh for each attempt`);
+    } else if (priorCheckOwners.has(attempt.agent_id)) {
+      errors.push(`${attemptBase}.agent_id: prior verifier owner evidence must remain in its earlier attempt`);
     } else {
       hasFreshOwner = true;
     }
@@ -613,16 +643,27 @@ function validateAttempts(value, unit, base, errors) {
     validateStateInvariants(attempt, attemptBase, errors);
 
     if (Array.isArray(attempt.local_checks)) {
+      const currentCheckOwners = new Set();
+      // The attempt's own artifacts are registered only after every one of its
+      // checks has been validated, so checks inside one attempt may share an
+      // artifact; reuse is rejected only across attempts.
+      const attemptArtifacts = [];
       attempt.local_checks.forEach((check, checkIndex) => {
         if (!isObject(check)) return;
         if (priorOwners.has(check.agent_id)) {
           errors.push(`${attemptBase}.local_checks[${checkIndex}].agent_id: prior assignment owner evidence must remain in its earlier attempt`);
         }
+        if (priorCheckOwners.has(check.agent_id)) {
+          errors.push(`${attemptBase}.local_checks[${checkIndex}].agent_id: prior verifier owner evidence must remain in its earlier attempt`);
+        }
         if (typeof check.artifact === "string" && priorArtifacts.has(check.artifact)) {
           errors.push(`${attemptBase}.local_checks[${checkIndex}].artifact: artifact from an earlier attempt cannot be reused`);
         }
-        if (check.method === "local" && typeof check.artifact === "string") priorArtifacts.add(check.artifact);
+        if (isSafeAgentId(check.agent_id)) currentCheckOwners.add(check.agent_id);
+        if (check.method === "local" && typeof check.artifact === "string") attemptArtifacts.push(check.artifact);
       });
+      for (const owner of currentCheckOwners) priorCheckOwners.add(owner);
+      for (const artifact of attemptArtifacts) priorArtifacts.add(artifact);
     }
     if (hasFreshOwner) priorOwners.add(attempt.agent_id);
   });
@@ -630,11 +671,17 @@ function validateAttempts(value, unit, base, errors) {
   if (isSafeAgentId(unit.agent_id) && priorOwners.has(unit.agent_id)) {
     errors.push(`${base}.agent_id: current assignment owner must be fresh after reassignment`);
   }
+  if (isSafeAgentId(unit.agent_id) && priorCheckOwners.has(unit.agent_id)) {
+    errors.push(`${base}.agent_id: current assignment owner must be fresh after reassignment`);
+  }
   if (Array.isArray(unit.local_checks)) {
     unit.local_checks.forEach((check, index) => {
       if (!isObject(check)) return;
       if (priorOwners.has(check.agent_id)) {
         errors.push(`${base}.local_checks[${index}].agent_id: prior assignment owner evidence must remain in its archived attempt`);
+      }
+      if (priorCheckOwners.has(check.agent_id)) {
+        errors.push(`${base}.local_checks[${index}].agent_id: prior verifier owner evidence must remain in its archived attempt`);
       }
       if (typeof check.artifact === "string" && priorArtifacts.has(check.artifact)) {
         errors.push(`${base}.local_checks[${index}].artifact: artifact from an archived attempt cannot be reused`);
@@ -700,6 +747,13 @@ function collectUnitErrors(unit, index) {
       }
     });
   }
+  if (typeof unit.ordinary_attack_class_block === "string" && Array.isArray(unit.excluded_blocks)) {
+    unit.excluded_blocks.forEach((entry, blockIndex) => {
+      if (isObject(entry) && entry.block === unit.ordinary_attack_class_block) {
+        errors.push(`${base}.excluded_blocks[${blockIndex}].block: block is also the ordinary attack-class block`);
+      }
+    });
+  }
 
   if (!PRIOR_STATUSES.has(unit.prior_status)) errors.push(`${base}.prior_status: invalid value ${safeQuote(unit.prior_status)}`);
   if (!STATUSES.has(unit.status)) errors.push(`${base}.status: invalid value ${safeQuote(unit.status)}`);
@@ -718,21 +772,53 @@ function collectUnitErrors(unit, index) {
   return errors;
 }
 
-function readFileWithinLimit(file) {
-  const noFollow = fs.constants.O_NOFOLLOW;
-  const nonBlock = fs.constants.O_NONBLOCK;
-  if (!Number.isInteger(noFollow) || noFollow === 0 || !Number.isInteger(nonBlock) || nonBlock === 0) {
-    // Node exposes no race-safe fallback on these platforms, so reject all inputs.
-    throw new SafeInputError("OS no-follow and nonblocking input protection is unavailable");
-  }
+// Two stat results name the same file when the volume and file index match.
+// A zero index means the filesystem did not report an identity, so nothing can be compared.
+function sameFileIdentity(left, right) {
+  return left.ino !== 0n && left.dev === right.dev && left.ino === right.ino;
+}
 
-  let descriptor;
+// Windows exposes neither O_NOFOLLOW nor O_NONBLOCK. Reject a link or non-regular path
+// before opening, then require the opened descriptor and a second lstat to name the same
+// file as the first lstat. A swap before or after the open changes the identity and is
+// rejected. A non-regular path such as CON or a named pipe is never opened, so the open
+// cannot block, and Windows filesystems have no FIFOs.
+// fsApi is injectable so tests can script a swap between the lstat, open and fstat calls.
+function openWindowsInputDescriptor(file, fsApi = fs) {
+  const before = fsApi.lstatSync(file, { bigint: true });
+  if (before.isSymbolicLink()) throw new SafeInputError("input must not be a symlink");
+  if (!before.isFile()) throw new SafeInputError("input must be a regular file");
+  const descriptor = fsApi.openSync(file, fs.constants.O_RDONLY);
   try {
-    descriptor = fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    const opened = fsApi.fstatSync(descriptor, { bigint: true });
+    const after = fsApi.lstatSync(file, { bigint: true });
+    if (after.isSymbolicLink() || !sameFileIdentity(before, opened) || !sameFileIdentity(opened, after)) {
+      throw new SafeInputError("input changed while it was opened");
+    }
+    return descriptor;
   } catch (error) {
-    if (error && (error.code === "ELOOP" || error.code === "EMLINK")) throw new SafeInputError("input must not be a symlink");
+    fsApi.closeSync(descriptor);
     throw error;
   }
+}
+
+function openInputDescriptor(file) {
+  const noFollow = fs.constants.O_NOFOLLOW;
+  const nonBlock = fs.constants.O_NONBLOCK;
+  if (Number.isInteger(noFollow) && noFollow !== 0 && Number.isInteger(nonBlock) && nonBlock !== 0) {
+    try {
+      return fs.openSync(file, fs.constants.O_RDONLY | noFollow | nonBlock);
+    } catch (error) {
+      if (error && (error.code === "ELOOP" || error.code === "EMLINK")) throw new SafeInputError("input must not be a symlink");
+      throw error;
+    }
+  }
+  if (process.platform === "win32") return openWindowsInputDescriptor(file);
+  throw new SafeInputError("OS no-follow and nonblocking input protection is unavailable");
+}
+
+function readFileWithinLimit(file) {
+  const descriptor = openInputDescriptor(file);
   try {
     const stat = fs.fstatSync(descriptor);
     if (!stat.isFile()) throw new SafeInputError("input must be a regular file");
@@ -758,7 +844,88 @@ function readFileWithinLimit(file) {
   }
 }
 
-function validateDocument(ledger) {
+// Only call after structural validation. The output tree is parent-owned and
+// must remain stable during this metadata-only check. This is not the sandbox's
+// race-safe artifact-promotion boundary; it never opens or reads artifact data.
+function collectArtifactErrors(ledger, outputDir) {
+  const errors = createErrorList();
+  if (typeof outputDir !== "string" || outputDir.length === 0) {
+    errors.push("$: output directory must be a non-empty path");
+    return errors;
+  }
+
+  let root;
+  try {
+    root = path.resolve(outputDir);
+    const stat = fs.lstatSync(root);
+    if (stat.isSymbolicLink()) {
+      errors.push("$: output directory must not be a symlink");
+    } else if (!stat.isDirectory()) {
+      errors.push("$: output directory must be a directory");
+    } else {
+      // Resolve platform aliases above the selected root once, then inspect
+      // every component below it without following a symlink or junction.
+      root = fs.realpathSync(root);
+    }
+  } catch {
+    errors.push("$: output directory could not be inspected");
+  }
+  if (errors.length > 0) return errors;
+
+  function checkArtifact(artifact, location) {
+    let current = root;
+    const components = artifact.split("/");
+    for (let index = 0; index < components.length; index++) {
+      current = path.join(current, components[index]);
+      let stat;
+      try {
+        stat = fs.lstatSync(current);
+      } catch (error) {
+        const reason = error && error.code === "ENOENT"
+          ? "local check artifact does not exist"
+          : "local check artifact could not be inspected";
+        errors.push(`${location}: ${reason}`);
+        return;
+      }
+      if (stat.isSymbolicLink()) {
+        errors.push(`${location}: artifact path must not contain symlinks`);
+        return;
+      }
+      if (index < components.length - 1) {
+        if (!stat.isDirectory()) {
+          errors.push(`${location}: artifact parent must be a directory`);
+          return;
+        }
+      } else if (!stat.isFile()) {
+        errors.push(`${location}: artifact must be a regular file`);
+      } else if (stat.nlink !== 1) {
+        errors.push(`${location}: artifact must not have multiple hard links`);
+      }
+    }
+  }
+
+  function checkRecord(record, location) {
+    for (let index = 0; index < record.local_checks.length; index++) {
+      if (errors.length >= LIMITS.validationErrors) return;
+      const check = record.local_checks[index];
+      if (check.method === "local") {
+        checkArtifact(check.artifact, `${location}.local_checks[${index}].artifact`);
+      }
+    }
+  }
+
+  for (let index = 0; index < ledger.length && errors.length < LIMITS.validationErrors; index++) {
+    const unit = ledger[index];
+    checkRecord(unit, `$[${index}]`);
+    for (let attempt = 0; attempt < unit.attempts.length && errors.length < LIMITS.validationErrors; attempt++) {
+      checkRecord(unit.attempts[attempt], `$[${index}].attempts[${attempt}]`);
+    }
+  }
+  return errors;
+}
+
+function validateDocument(ledger, options = {}) {
+  const terminal = options.terminal === true;
   const errors = createErrorList();
   if (!Array.isArray(ledger)) {
     errors.push("$: expected a top-level array");
@@ -778,6 +945,12 @@ function validateDocument(ledger) {
   for (let index = 0; index < ledger.length && errors.length < LIMITS.validationErrors; index++) {
     const unit = ledger[index];
     errors.push(...collectUnitErrors(unit, index));
+    if (terminal && isObject(unit) && unit.status === "in_progress") {
+      errors.push(`$[${index}].status: terminal ledger cannot include in_progress units`);
+    }
+    if (terminal && isObject(unit) && unit.status === "planned") {
+      errors.push(`$[${index}].status: terminal ledger cannot include planned units`);
+    }
     if (errors.length >= LIMITS.validationErrors) break;
     if (!isObject(unit) || typeof unit.coverage_id !== "string") continue;
 
@@ -802,14 +975,40 @@ function validateDocument(ledger) {
     }
     previousId = unit.coverage_id;
   }
+  if (errors.length === 0 && hasOwn(options, "outputDir")) {
+    errors.push(...collectArtifactErrors(ledger, options.outputDir));
+  }
   return errors;
 }
 
-function run(file) {
-  if (!file) {
-    console.error("Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json>");
+// The ledger path comes first; each flag may appear at most once. Anything else is a
+// usage error rather than a silently ignored argument.
+function parseCliArgs(args) {
+  const [file, ...rest] = args;
+  if (!file || file.startsWith("--")) return null;
+  let terminal = false;
+  let outputDir;
+  for (let index = 0; index < rest.length; index++) {
+    const arg = rest[index];
+    if (arg === "--terminal" && !terminal) {
+      terminal = true;
+    } else if (arg === "--output-dir" && outputDir === undefined) {
+      outputDir = rest[++index];
+      if (!outputDir || outputDir.startsWith("--")) return null;
+    } else {
+      return null;
+    }
+  }
+  return { file, terminal, outputDir };
+}
+
+function run(args = process.argv.slice(2)) {
+  const parsed = parseCliArgs(args);
+  if (!parsed) {
+    console.error("Usage: node validate-coverage-ledger.cjs <path-to-coverage-ledger.json> [--terminal] [--output-dir <run-dir>]");
     return 1;
   }
+  const { file, terminal, outputDir } = parsed;
 
   let contents;
   try {
@@ -837,7 +1036,7 @@ function run(file) {
 
   let errors;
   try {
-    errors = validateDocument(ledger);
+    errors = validateDocument(ledger, { terminal, outputDir: outputDir || path.dirname(path.resolve(file)) });
   } catch {
     console.error("Failed to validate coverage ledger: unexpected validation error");
     return 1;
@@ -863,10 +1062,12 @@ module.exports = {
   hasVisibleProse,
   isSafeAgentId,
   isSafeRelativePath,
+  openWindowsInputDescriptor,
+  sameFileIdentity,
   preflightJsonText,
   readFileWithinLimit,
   safeQuote,
   validateDocument,
 };
 
-if (require.main === module) process.exit(run(process.argv[2]));
+if (require.main === module) process.exit(run(process.argv.slice(2)));

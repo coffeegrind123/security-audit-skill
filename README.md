@@ -15,7 +15,7 @@ The skill runs a structured audit in six phases:
 5. **Independent record verification** -- fresh agents verify final source claims. Material replacements receive another independent verifier.
 6. **Target-neutral reporting** -- derive `REPORT.md`, `FINDINGS-DETAIL.md`, and `NEEDS-VALIDATION.md` from the verified records and coverage ledger.
 
-The parent runs `validate-coverage-ledger.cjs` after creating the ledger and after each later ledger update. It runs `validate-findings.cjs` in Phase 4 and again after every Phase 5 replacement.
+The parent runs `validate-coverage-ledger.cjs` after creating the ledger and after each later ledger update, and with `--terminal` in Phase 4 and after every Phase 5 replacement so a complete claim cannot retain open assignments. It runs `validate-findings.cjs` in Phase 4 and again after every Phase 5 replacement.
 
 The verdicts are distinct: `confirmed` has a complete source trace and bounded observed result, `needs_validation` has an exact unresolved fact and no severity, and `rejected` records a disproved candidate.
 
@@ -26,6 +26,9 @@ Multiple runs against the same repo are additive. The skill uses prior ledgers a
 | File | Purpose |
 |------|---------|
 | `SKILL.md` | Setup, core principles, platform terminology, workflow overview, and audit anti-patterns |
+| `EXECUTION-SAFETY.md` | Untrusted-target rules read before any git command, source copy, or delegation: neutralized git, symlink-safe copies, the untrusted-content prompt block, run identity, and prior-run compatibility |
+| `BUDGET.md` | Full-audit cost budget, read before reconnaissance when a budget is set |
+| `SANDBOX-DOCKER.md` | Provisioning an isolated sibling Docker sandbox when the agent cannot unshare |
 | `RECONNAISSANCE.md` | Phase 1 reconnaissance prompts and synthesis instructions |
 | `HUNTING.md` | Phase 2 orchestration, hunting methodology, and validation rules |
 | `ATTACK-CLASSES.md` | Core, wildcard, and obvious-things attack prompts |
@@ -39,6 +42,8 @@ Multiple runs against the same repo are additive. The skill uses prior ledgers a
 | `RESOURCE-EXHAUSTION-AND-AVAILABILITY.md` | Shared resource, quota, queue, worker, and operator-spend hunting classes |
 | `DATA-ISOLATION-AND-LIFECYCLE.md` | Tenant isolation, cache, search, export, backup, migration, deletion, and restore hunting classes |
 | `DESKTOP-MOBILE-AND-LOCAL-IPC.md` | Native app, deep-link, webview, exported-component, helper, daemon, and local-IPC hunting classes |
+| `CRYPTOGRAPHY-AND-KEY-MANAGEMENT.md` | Cryptographic algorithm, cipher mode, randomness, signature, MAC, TLS, and key-lifecycle hunting classes |
+| `ANDROID.md` | Android component, URI grant, intent, Binder, WebView, app-state, and release-configuration hunting classes |
 | `VALIDATION-AND-REPORTING.md` | Phases 3–6 candidate validation, structured output, record verification, and reporting |
 | `report-schema.json` | JSON schema for all three `findings.json` verdicts |
 | `validate-findings.cjs` | Zero-dependency validator for `findings.json` in Phases 4 and 5 |
@@ -81,7 +86,7 @@ find security vulnerabilities in ./src
 do a security review, output to ~/audits/my-project
 ```
 
-The skill activates automatically when the request matches its trigger (security audit, find vulnerabilities, pen-test the code, etc.). A direct codebase audit or pen-test request uses full audit mode. Security questions and focused vulnerability work use guidance mode unless you request report artifacts. In full audit mode, an unspecified output directory defaults to `~/security-audit-skill/<repo-name>/run-<N>`. The workflow writes inside the target repository only when you explicitly select a directory that version control ignores.
+The skill activates automatically when the request matches its trigger (security audit, find vulnerabilities, pen-test the code, etc.). A direct codebase audit or pen-test request uses full audit mode. Security questions and focused vulnerability work use guidance mode unless you request report artifacts. In full audit mode, an unspecified output directory defaults to `~/security-audit-skill/<repo-id>/run-<N>`, where `<repo-id>` is a sanitized repo name plus a hash of the target path, so a target cannot steer the output path or reuse another target's prior runs. The workflow writes inside the target repository only when you explicitly select a directory that version control ignores.
 
 ## Requirements
 
